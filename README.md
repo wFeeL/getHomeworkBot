@@ -24,7 +24,7 @@ Clone the project and run it locally
 git clone https://github.com/wFeeL/getHomework_bot.git
 cd getHomework_bot
 pip install -r requirements.txt
-python -m telegram_bot.bot
+python3 -m telegram_bot.bot
 ```
 
 

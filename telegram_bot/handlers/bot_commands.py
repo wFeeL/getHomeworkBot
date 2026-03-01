@@ -4,7 +4,6 @@ import asyncio
 import datetime
 import json
 import logging
-import random
 from typing import Iterable
 
 import aiohttp
@@ -28,8 +27,10 @@ from telegram_bot.database_methods.database_request import (
     get_admins,
     get_class,
     get_homework,
+    get_homework_count,
+    get_homework_page,
     get_homework_with_subject_by_date,
-    get_quotes,
+    get_random_quote,
     get_schedule,
     get_subject,
     get_teachers,
@@ -37,6 +38,7 @@ from telegram_bot.database_methods.database_request import (
     get_user_count,
     get_users,
     get_weekday,
+    is_admin_active_in_class,
     update_user_class,
 )
 from telegram_bot.decorators import check_admin, check_class, check_super_admin
@@ -110,8 +112,7 @@ async def _get_admin_class_id(telegram_id: int) -> int:
 
 
 async def _is_admin_in_class(telegram_id: int, class_id: int) -> bool:
-    admins = await get_admins(value=True, class_id=class_id)
-    return str(telegram_id) in [a[0] for a in admins]
+    return await is_admin_active_in_class(telegram_id=telegram_id, class_id=class_id)
 
 
 async def _is_super_admin_user(telegram_id: int) -> bool:
@@ -127,6 +128,27 @@ async def _is_admin_allowed_for_homework(telegram_id: int, homework_id: int) -> 
     return await _is_admin_in_class(telegram_id, class_id)
 
 
+async def _load_chat_map(bot, chat_ids: Iterable[int | str], *, concurrency: int = 8) -> dict[str, object]:
+    """Fetch Telegram chats concurrently with a conservative concurrency limit."""
+    semaphore = asyncio.Semaphore(concurrency)
+    result: dict[str, object] = {}
+
+    async def _load(chat_id: int | str) -> None:
+        async with semaphore:
+            try:
+                chat = await bot.get_chat(chat_id=chat_id)
+            except TelegramBadRequest:
+                logger.info("Chat id %s can't be found", chat_id)
+                return
+            except Exception as error:
+                logger.info("%s while getting chat for %s", error.__class__.__name__, chat_id)
+                return
+            result[str(chat_id)] = chat
+
+    await asyncio.gather(*(_load(chat_id) for chat_id in chat_ids))
+    return result
+
+
 async def _try_edit_callback_text(
     callback: CallbackQuery,
     text: str,
@@ -136,6 +158,28 @@ async def _try_edit_callback_text(
         await callback.message.edit_text(text=text, reply_markup=reply_markup)
         return True
     except TelegramBadRequest as error:
+        if "message is not modified" in error.message.lower():
+            return True
+        logger.info(error.message)
+        return False
+
+
+async def _try_edit_callback_media_photo(
+    callback: CallbackQuery,
+    photo: str,
+    caption: str,
+    reply_markup=None,
+) -> bool:
+    if not callback.message.photo:
+        return False
+
+    try:
+        media = InputMediaPhoto(media=photo, caption=caption)
+        await callback.message.edit_media(media=media, reply_markup=reply_markup)
+        return True
+    except TelegramBadRequest as error:
+        if "message is not modified" in error.message.lower():
+            return True
         logger.info(error.message)
         return False
 
@@ -234,14 +278,15 @@ async def send_class(message: Message, *, edit: bool = False, **kwargs) -> None:
     await authorize_user(message)
 
     class_id = await _get_user_class_id(message.chat.id)
-    admin_rows = await get_admins(telegram_id=message.chat.id)
+    admin_rows, class_len, admin_class_len, class_data = await asyncio.gather(
+        get_admins(telegram_id=message.chat.id),
+        get_user_count(class_id=class_id),
+        get_admin_count(class_id=class_id),
+        get_class(id=class_id),
+    )
     is_super_admin = bool(admin_rows and admin_rows[0][3])
 
     markup = inline_markup.get_class_keyboard(class_id=class_id, is_super_admin=is_super_admin)
-    class_len = await get_user_count(class_id=class_id)
-    admin_class_len = await get_admin_count(class_id=class_id)
-
-    class_data = await get_class(id=class_id)
     if class_data:
         letter, number = class_data[0][1], class_data[0][2]
     else:
@@ -430,40 +475,39 @@ async def send_edit_menu(message: Message, **kwargs) -> None:
 @router.message(Command('admins'))
 @check_super_admin
 async def send_admins_menu(message: Message, **kwargs) -> None:
-    admins_rows = await get_admins(value=True)
-    admin_ids = [row[0] for row in admins_rows]
+    admins_rows, class_rows = await asyncio.gather(get_admins(value=True), get_class(value=True))
+    admin_ids = [str(row[0]) for row in admins_rows]
+    admin_class_map = {str(row[0]): int(row[1] or 0) for row in admins_rows}
+    class_map = {int(row[0]): (row[1], row[2]) for row in class_rows}
+    chat_map = await _load_chat_map(message.bot, admin_ids, concurrency=6)
 
     admins_without_class = []
     text = text_message.ADMINS_LIST
     count = 1
 
     for admin_id in admin_ids:
-        try:
-            admin_chat = await message.bot.get_chat(chat_id=admin_id)
-        except Exception as error:
-            logger.info("%s while getting chat for %s", error.__class__.__name__, admin_id)
+        admin_chat = chat_map.get(admin_id)
+        if admin_chat is None:
+            continue
+        if admin_chat.username is None:
             continue
 
-        try:
-            admin_info = await get_admins(telegram_id=admin_chat.id)
-            class_id = int(admin_info[0][1]) if admin_info else 0
-            class_data = await get_class(id=class_id)
-            if not class_data:
-                raise IndexError
-            letter, number = class_data[0][1], class_data[0][2]
-
-            if admin_chat.username is not None:
-                text += text_message.ADMIN_FORM.format(
-                    index=count,
-                    name=admin_chat.first_name,
-                    username=admin_chat.username,
-                    telegram_id=admin_chat.id,
-                    letter=letter,
-                    number=number,
-                )
-                count += 1
-        except IndexError:
+        class_id = admin_class_map.get(admin_id, 0)
+        class_data = class_map.get(class_id)
+        if class_data is None:
             admins_without_class.append(admin_chat)
+            continue
+
+        letter, number = class_data
+        text += text_message.ADMIN_FORM.format(
+            index=count,
+            name=admin_chat.first_name,
+            username=admin_chat.username,
+            telegram_id=admin_chat.id,
+            letter=letter,
+            number=number,
+        )
+        count += 1
 
     if admins_without_class:
         await message.answer(
@@ -478,20 +522,17 @@ async def send_admins_menu(message: Message, **kwargs) -> None:
 @router.message(Command('users'))
 @check_admin
 async def send_users_list(message: Message, **kwargs) -> None:
-    users_rows = await get_users()
-    user_ids = [row[0] for row in users_rows]
-
-    admins_rows = await get_admins(value=True)
-    admin_id_set = {row[0] for row in admins_rows}
+    users_rows, admins_rows = await asyncio.gather(get_users(), get_admins(value=True))
+    user_ids = [str(row[0]) for row in users_rows]
+    admin_id_set = {str(row[0]) for row in admins_rows}
+    chat_map = await _load_chat_map(message.bot, user_ids, concurrency=8)
 
     text = text_message.USERS_LIST
     count = 0
 
     for user_id in user_ids:
-        try:
-            user_chat = await message.bot.get_chat(chat_id=user_id)
-        except TelegramBadRequest:
-            logger.info("User chat id %s can't be found", user_id)
+        user_chat = chat_map.get(user_id)
+        if user_chat is None:
             continue
 
         if user_chat.username is None:
@@ -558,7 +599,13 @@ async def send_add_teacher(message: Message, state: FSMContext, **kwargs) -> Non
 @router.callback_query(lambda call: call.data in list(callback_text.CALLBACK.values()))
 async def handle_callback(callback: CallbackQuery, **kwargs) -> None:
     callback_data = callback.data or ""
-    class_id = await _get_user_class_id(callback.message.chat.id)
+    class_id: int | None = None
+
+    async def ensure_class_id() -> int:
+        nonlocal class_id
+        if class_id is None:
+            class_id = await _get_user_class_id(callback.message.chat.id)
+        return class_id
 
     if callback_data == callback_text.CALLBACK['send_choose_class']:
         markup = await inline_markup.get_choose_class_keyboard()
@@ -567,7 +614,8 @@ async def handle_callback(callback: CallbackQuery, **kwargs) -> None:
         return
 
     if callback_data == callback_text.CALLBACK['send_menu']:
-        if class_id == 0:
+        current_class_id = await ensure_class_id()
+        if current_class_id == 0:
             markup = await inline_markup.get_choose_class_keyboard()
             if not await _try_edit_callback_text(callback, text_message.CHOOSE_CLASS, markup):
                 await callback.message.answer(text=text_message.CHOOSE_CLASS, reply_markup=markup)
@@ -577,11 +625,12 @@ async def handle_callback(callback: CallbackQuery, **kwargs) -> None:
         return
 
     if callback_data == callback_text.CALLBACK['send_help']:
-        if class_id == 0:
+        current_class_id = await ensure_class_id()
+        if current_class_id == 0:
             markup = inline_markup.get_help_keyboard(is_class=False)
             text = text_message.HELP.format(class_text=text_message.CLASS_NOT_CHOSEN)
         else:
-            class_data_rows = await get_class(id=class_id)
+            class_data_rows = await get_class(id=current_class_id)
             if class_data_rows:
                 letter, number = class_data_rows[0][1], class_data_rows[0][2]
                 class_text = text_message.CLASS_CHOSEN.format(number=number, letter=letter)
@@ -595,18 +644,20 @@ async def handle_callback(callback: CallbackQuery, **kwargs) -> None:
         return
 
     if callback_data == callback_text.CALLBACK['send_all_homework']:
-        if class_id == 0:
+        current_class_id = await ensure_class_id()
+        if current_class_id == 0:
             markup = await inline_markup.get_choose_class_keyboard()
             if not await _try_edit_callback_text(callback, text_message.CHOOSE_CLASS, markup):
                 await callback.message.answer(text=text_message.CHOOSE_CLASS, reply_markup=markup)
             return
-        markup = await inline_markup.get_all_homework_keyboard(class_id)
+        markup = await inline_markup.get_all_homework_keyboard(current_class_id)
         if not await _try_edit_callback_text(callback, text_message.CHOOSE_SUBJECT, markup):
             await callback.message.answer(text=text_message.CHOOSE_SUBJECT, reply_markup=markup)
         return
 
     if callback_data == callback_text.CALLBACK['send_tomorrow_homework']:
-        if class_id == 0:
+        current_class_id = await ensure_class_id()
+        if current_class_id == 0:
             markup = await inline_markup.get_choose_class_keyboard()
             if not await _try_edit_callback_text(callback, text_message.CHOOSE_CLASS, markup):
                 await callback.message.answer(text=text_message.CHOOSE_CLASS, reply_markup=markup)
@@ -616,18 +667,20 @@ async def handle_callback(callback: CallbackQuery, **kwargs) -> None:
         return
 
     if callback_data == callback_text.CALLBACK['send_schedule']:
-        if class_id == 0:
+        current_class_id = await ensure_class_id()
+        if current_class_id == 0:
             markup = await inline_markup.get_choose_class_keyboard()
             if not await _try_edit_callback_text(callback, text_message.CHOOSE_CLASS, markup):
                 await callback.message.answer(text=text_message.CHOOSE_CLASS, reply_markup=markup)
             return
-        markup = await inline_markup.get_schedule_keyboard(class_id)
+        markup = await inline_markup.get_schedule_keyboard(current_class_id)
         if not await _try_edit_callback_text(callback, text_message.CHOOSE_WEEKDAY, markup):
             await callback.message.answer(text=text_message.CHOOSE_WEEKDAY, reply_markup=markup)
         return
 
     if callback_data == callback_text.CALLBACK['send_class']:
-        if class_id == 0:
+        current_class_id = await ensure_class_id()
+        if current_class_id == 0:
             markup = await inline_markup.get_choose_class_keyboard()
             if not await _try_edit_callback_text(callback, text_message.CHOOSE_CLASS, markup):
                 await callback.message.answer(text=text_message.CHOOSE_CLASS, reply_markup=markup)
@@ -639,7 +692,7 @@ async def handle_callback(callback: CallbackQuery, **kwargs) -> None:
     await callback_text.call_function_from_callback(callback, **kwargs)
 
 
-@router.callback_query(lambda call: 'date' in call.data and 'True' not in call.data)
+@router.callback_query(lambda call: 'date' in (call.data or '') and 'True' not in (call.data or ''))
 async def handle_date_homework(callback: CallbackQuery) -> None:
     callback_data = json.loads(callback.data)
     date_str = callback_data['date']
@@ -658,7 +711,7 @@ async def handle_date_homework(callback: CallbackQuery) -> None:
     await send_date_homework(callback, dt)
 
 
-@router.callback_query(lambda call: 'page' in call.data and 'len' in call.data)
+@router.callback_query(lambda call: 'page' in (call.data or '') and 'len' in (call.data or ''))
 async def handle_homework_pagination(callback: CallbackQuery) -> None:
     try:
         callback_data = json.loads(callback.data)
@@ -673,8 +726,8 @@ async def handle_homework_pagination(callback: CallbackQuery) -> None:
         subject_name = subject_rows[0][1]
         subject_sticker = subject_rows[0][2]
 
-        homework_data = await get_homework(subject_id=subject_id, class_id=class_id)
-        if not homework_data:
+        length = await get_homework_count(subject_id=subject_id, class_id=class_id)
+        if length == 0:
             if not await _try_edit_callback_text(
                 callback,
                 text_message.SUBJECT_HOMEWORK_IS_NULL.format(subject_sticker=subject_sticker, subject_name=subject_name),
@@ -686,9 +739,11 @@ async def handle_homework_pagination(callback: CallbackQuery) -> None:
                 )
             return
 
-        length = len(homework_data)
         page = min(max(page, 1), length)
-        current_row = homework_data[page - 1]
+        current_row = await get_homework_page(subject_id=subject_id, class_id=class_id, page=page)
+        if current_row is None:
+            raise IndexError
+
         homework_id = int(current_row[0])
         date_val, description, file_id = current_row[2], current_row[3], current_row[4]
         date_text = date_val.strftime("%d.%m.%Y") if hasattr(date_val, "strftime") else str(date_val)
@@ -711,25 +766,31 @@ async def handle_homework_pagination(callback: CallbackQuery) -> None:
         )
 
         if file_id != 'None':
-            try:
-                await callback.message.delete()
-            except TelegramBadRequest as error:
-                logger.info(error.message)
-            await callback.message.bot.send_photo(
-                caption=text,
-                reply_markup=markup,
-                photo=file_id,
-                chat_id=callback.message.chat.id,
-            )
+            if not await _try_edit_callback_media_photo(callback, str(file_id), text, markup):
+                try:
+                    await callback.message.delete()
+                except TelegramBadRequest as error:
+                    logger.info(error.message)
+                await callback.message.bot.send_photo(
+                    caption=text,
+                    reply_markup=markup,
+                    photo=file_id,
+                    chat_id=callback.message.chat.id,
+                )
         else:
             if not await _try_edit_callback_text(callback, text, markup):
+                if callback.message.photo:
+                    try:
+                        await callback.message.delete()
+                    except TelegramBadRequest as error:
+                        logger.info(error.message)
                 await callback.message.answer(text=text, reply_markup=markup)
 
     except Exception:
         await callback.message.answer(text_message.TEXT_ERROR, reply_markup=inline_markup.get_delete_message_keyboard())
 
 
-@router.callback_query(lambda call: 'weekday_index' in call.data)
+@router.callback_query(lambda call: 'weekday_index' in (call.data or ''))
 async def handle_schedule(callback: CallbackQuery) -> None:
     callback_data = json.loads(callback.data)
     weekday_index = int(callback_data['weekday_index'])
@@ -759,10 +820,10 @@ async def handle_schedule(callback: CallbackQuery) -> None:
     schedule_text = '\n'.join(schedule_data)
 
     if not is_homework:
-        await callback.message.edit_text(
-            text=text_message.SCHEDULE_TEXT.format(weekday_name=weekday_name_rus_accs, schedule=schedule_text),
-            reply_markup=inline_markup.get_weekday_keyboard(weekday_index),
-        )
+        text = text_message.SCHEDULE_TEXT.format(weekday_name=weekday_name_rus_accs, schedule=schedule_text)
+        markup = inline_markup.get_weekday_keyboard(weekday_index)
+        if not await _try_edit_callback_text(callback, text, markup):
+            await callback.message.answer(text=text, reply_markup=markup)
     else:
         await callback.message.answer(
             text=text_message.SCHEDULE_TEXT.format(weekday_name=weekday_name_rus_accs, schedule=schedule_text),
@@ -770,7 +831,9 @@ async def handle_schedule(callback: CallbackQuery) -> None:
         )
 
 
-@router.callback_query(lambda call: 'class_id' in call.data and ('edit' not in call.data and 'delete' not in call.data))
+@router.callback_query(
+    lambda call: 'class_id' in (call.data or '') and ('edit' not in (call.data or '') and 'delete' not in (call.data or ''))
+)
 async def handle_class(callback: CallbackQuery, **kwargs) -> None:
     callback_data = json.loads(callback.data)
     class_id = int(callback_data['class_id'])
@@ -779,7 +842,7 @@ async def handle_class(callback: CallbackQuery, **kwargs) -> None:
     await send_class(callback.message, edit=True, **kwargs)
 
 
-@router.callback_query(lambda call: 'class_id' in call.data and 'edit' in call.data)
+@router.callback_query(lambda call: 'class_id' in (call.data or '') and 'edit' in (call.data or ''))
 async def handle_edit_class(callback: CallbackQuery, state: FSMContext) -> None:
     if not await _is_super_admin_user(callback.message.chat.id):
         await callback.message.answer(
@@ -799,7 +862,7 @@ async def handle_edit_class(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.message.answer(text_message.INCORRECT_REQUEST, reply_markup=inline_markup.get_delete_message_keyboard())
 
 
-@router.callback_query(lambda call: 'class_id' in call.data and 'delete' in call.data)
+@router.callback_query(lambda call: 'class_id' in (call.data or '') and 'delete' in (call.data or ''))
 async def handle_delete_class(callback: CallbackQuery) -> None:
     if not await _is_super_admin_user(callback.message.chat.id):
         await callback.message.answer(
@@ -817,7 +880,7 @@ async def handle_delete_class(callback: CallbackQuery) -> None:
         await callback.message.answer(text_message.INCORRECT_REQUEST, reply_markup=inline_markup.get_delete_message_keyboard())
 
 
-@router.callback_query(lambda call: 'admin' in call.data)
+@router.callback_query(lambda call: 'admin' in (call.data or ''))
 async def handle_edit_admins(callback: CallbackQuery, state: FSMContext) -> None:
     if not await _is_super_admin_user(callback.message.chat.id):
         await callback.message.answer(
@@ -829,7 +892,7 @@ async def handle_edit_admins(callback: CallbackQuery, state: FSMContext) -> None
     await edit_admins.edit_admins(callback.message, state, is_active)
 
 
-@router.callback_query(lambda call: 'homework_id' in call.data and 'edit' in call.data)
+@router.callback_query(lambda call: 'homework_id' in (call.data or '') and 'edit' in (call.data or ''))
 async def handle_edit_data(callback: CallbackQuery, state: FSMContext) -> None:
     try:
         callback_data = json.loads(callback.data)
@@ -847,7 +910,7 @@ async def handle_edit_data(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.message.answer(text_message.INCORRECT_REQUEST, reply_markup=inline_markup.get_delete_message_keyboard())
 
 
-@router.callback_query(lambda call: 'homework_id' in call.data and 'delete' in call.data)
+@router.callback_query(lambda call: 'homework_id' in (call.data or '') and 'delete' in (call.data or ''))
 async def handle_delete_homework_data(callback: CallbackQuery) -> None:
     try:
         callback_data = json.loads(callback.data)
@@ -862,7 +925,9 @@ async def handle_delete_homework_data(callback: CallbackQuery) -> None:
         await callback.message.answer(text_message.INCORRECT_REQUEST, reply_markup=inline_markup.get_delete_message_keyboard())
 
 
-@router.callback_query(lambda call: 'subject_id' in call.data and ('edit' not in call.data and 'delete' not in call.data))
+@router.callback_query(
+    lambda call: 'subject_id' in (call.data or '') and ('edit' not in (call.data or '') and 'delete' not in (call.data or ''))
+)
 async def handle_select_subject(callback: CallbackQuery) -> None:
     try:
         if not await _is_super_admin_user(callback.message.chat.id):
@@ -893,7 +958,7 @@ async def handle_select_subject(callback: CallbackQuery) -> None:
         await callback.message.answer(text_message.INCORRECT_REQUEST, reply_markup=inline_markup.get_delete_message_keyboard())
 
 
-@router.callback_query(lambda call: 'subject_id' in call.data and 'edit' in call.data)
+@router.callback_query(lambda call: 'subject_id' in (call.data or '') and 'edit' in (call.data or ''))
 async def handle_edit_subject(callback: CallbackQuery, state: FSMContext) -> None:
     try:
         if not await _is_super_admin_user(callback.message.chat.id):
@@ -918,7 +983,7 @@ async def handle_edit_subject(callback: CallbackQuery, state: FSMContext) -> Non
         await callback.message.answer(text_message.INCORRECT_REQUEST, reply_markup=inline_markup.get_delete_message_keyboard())
 
 
-@router.callback_query(lambda call: 'subject_id' in call.data and 'delete' in call.data)
+@router.callback_query(lambda call: 'subject_id' in (call.data or '') and 'delete' in (call.data or ''))
 async def handle_delete_subject_data(callback: CallbackQuery) -> None:
     try:
         if not await _is_super_admin_user(callback.message.chat.id):
@@ -1012,6 +1077,9 @@ async def send_date_homework(message: Message | CallbackQuery, date_value: datet
         photos = [row[4] for row in homework_data if row[4] != 'None']
 
         if len(photos) == 1:
+            if callback is not None and await _try_edit_callback_media_photo(callback, str(photos[0]), homework_text, markup):
+                return
+
             if callback is not None:
                 try:
                     await callback.message.delete()
@@ -1042,20 +1110,29 @@ async def send_date_homework(message: Message | CallbackQuery, date_value: datet
         else:
             if callback is not None:
                 if not await _try_edit_callback_text(callback, homework_text, markup):
+                    if callback.message.photo:
+                        try:
+                            await callback.message.delete()
+                        except TelegramBadRequest as error:
+                            logger.info(error.message)
                     await msg.answer(text=homework_text, reply_markup=markup)
             else:
                 await msg.answer(text=homework_text, reply_markup=markup)
 
     else:
-        quote_rows = await get_quotes(value=True)
-        if quote_rows:
-            quote_row = random.choice(quote_rows)
-            quote, author = quote_row[0], quote_row[1]
-        else:
+        quote_data = await get_random_quote()
+        if quote_data is None:
             quote, author = "", ""
+        else:
+            quote, author = quote_data
         text = text_message.HOMEWORK_IS_NULL.format(date=f"{weekday_name} {date_text}", quote=quote, author=author)
         if callback is not None:
             if not await _try_edit_callback_text(callback, text, markup):
+                if callback.message.photo:
+                    try:
+                        await callback.message.delete()
+                    except TelegramBadRequest as error:
+                        logger.info(error.message)
                 await msg.answer(text=text, reply_markup=markup)
         else:
             await msg.answer(text=text, reply_markup=markup)

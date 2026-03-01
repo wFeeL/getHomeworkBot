@@ -170,9 +170,32 @@ async def get_homework(
 
     q = (
         "SELECT id, subject_id, date, description, file_id, class_id "
-        "FROM homework" + _where(clauses) + " ORDER BY date, subject_id"
+        "FROM homework" + _where(clauses) + " ORDER BY date, subject_id, id"
     )
     return await db.fetch(q, *args)
+
+
+async def get_homework_count(subject_id: int | str, class_id: int | str) -> int:
+    value = await db.fetchval(
+        "SELECT COUNT(*) FROM homework WHERE subject_id = $1 AND class_id = $2",
+        int(subject_id),
+        int(class_id),
+    )
+    return int(value or 0)
+
+
+async def get_homework_page(subject_id: int | str, class_id: int | str, page: int) -> Optional[Sequence]:
+    page_index = max(int(page), 1) - 1
+    return await db.fetchrow(
+        "SELECT id, subject_id, date, description, file_id, class_id "
+        "FROM homework "
+        "WHERE subject_id = $1 AND class_id = $2 "
+        "ORDER BY date, subject_id, id "
+        "OFFSET $3 LIMIT 1",
+        int(subject_id),
+        int(class_id),
+        page_index,
+    )
 
 
 async def get_schedule(weekday: str, class_id: int | str) -> list:
@@ -219,6 +242,19 @@ async def get_quotes(text: str | None = None, author: str | None = None, value: 
     return await db.fetch(q, *args)
 
 
+async def get_random_quote() -> Optional[tuple[str, str]]:
+    row = await db.fetchrow(
+        "SELECT text, author "
+        "FROM quotes "
+        "WHERE value = true "
+        "ORDER BY random() "
+        "LIMIT 1"
+    )
+    if row is None:
+        return None
+    return str(row[0]), str(row[1])
+
+
 async def get_user_count(class_id: int | str) -> int:
     value = await db.fetchval("SELECT COUNT(*) FROM users WHERE class_id = $1", int(class_id))
     return int(value or 0)
@@ -233,6 +269,15 @@ async def get_admin_count(class_id: int | str, *, active_only: bool = False) -> 
     else:
         value = await db.fetchval("SELECT COUNT(*) FROM admins WHERE class_id = $1", int(class_id))
     return int(value or 0)
+
+
+async def is_admin_active_in_class(telegram_id: int | str, class_id: int | str) -> bool:
+    value = await db.fetchval(
+        "SELECT 1 FROM admins WHERE telegram_id = $1 AND class_id = $2 AND value = true LIMIT 1",
+        str(telegram_id),
+        int(class_id),
+    )
+    return bool(value)
 
 
 async def get_homework_counts_by_subject(class_id: int | str) -> dict[int, int]:
@@ -266,7 +311,7 @@ async def get_homework_with_subject_by_date(
         "FROM homework h "
         "LEFT JOIN subject s ON s.id = h.subject_id AND s.class_ids @> ARRAY[$1]::int[] "
         "WHERE h.class_id = $1 AND h.date >= $2 AND h.date < $3 "
-        "ORDER BY h.date, h.subject_id"
+        "ORDER BY h.date, h.subject_id, h.id"
     )
     return await db.fetch(q, int(class_id), start_dt, end_dt)
 

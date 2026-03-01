@@ -482,6 +482,9 @@ CREATE INDEX IF NOT EXISTS idx_schedule_class_weekday_weight
 CREATE INDEX IF NOT EXISTS idx_admins_class_value
     ON public.admins USING btree (class_id, value);
 
+CREATE INDEX IF NOT EXISTS idx_admins_telegram_id
+    ON public.admins USING btree (telegram_id);
+
 CREATE INDEX IF NOT EXISTS idx_subject_class_ids_gin
     ON public.subject USING gin (class_ids);
 
