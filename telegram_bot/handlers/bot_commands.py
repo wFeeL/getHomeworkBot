@@ -158,8 +158,15 @@ async def _try_edit_callback_text(
         await callback.message.edit_text(text=text, reply_markup=reply_markup)
         return True
     except TelegramBadRequest as error:
-        if "message is not modified" in error.message.lower():
+        error_message = error.message.lower()
+        if "message is not modified" in error_message:
             return True
+        if "there is no text in the message to edit" in error_message:
+            try:
+                await callback.message.delete()
+            except TelegramBadRequest as delete_error:
+                logger.info(delete_error.message)
+            return False
         logger.info(error.message)
         return False
 
