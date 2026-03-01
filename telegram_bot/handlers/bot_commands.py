@@ -9,7 +9,7 @@ from typing import Iterable
 import aiohttp
 import pymorphy3
 from aiogram import F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
@@ -154,21 +154,29 @@ async def _try_edit_callback_text(
     text: str,
     reply_markup=None,
 ) -> bool:
-    try:
-        await callback.message.edit_text(text=text, reply_markup=reply_markup)
-        return True
-    except TelegramBadRequest as error:
-        error_message = error.message.lower()
-        if "message is not modified" in error_message:
+    for attempt in range(2):
+        try:
+            await callback.message.edit_text(text=text, reply_markup=reply_markup, request_timeout=20)
             return True
-        if "there is no text in the message to edit" in error_message:
-            try:
-                await callback.message.delete()
-            except TelegramBadRequest as delete_error:
-                logger.info(delete_error.message)
+        except TelegramBadRequest as error:
+            error_message = (error.message or "").lower()
+            if "message is not modified" in error_message:
+                return True
+            if "there is no text in the message to edit" in error_message:
+                try:
+                    await callback.message.delete()
+                except TelegramBadRequest as delete_error:
+                    logger.info(delete_error.message)
+                return False
+            logger.info(error.message)
             return False
-        logger.info(error.message)
-        return False
+        except TelegramNetworkError as error:
+            if attempt == 0:
+                await asyncio.sleep(0.6)
+                continue
+            logger.warning("Telegram timeout while editing text: %s", error)
+            return False
+    return False
 
 
 async def _try_edit_callback_media_photo(
@@ -180,15 +188,23 @@ async def _try_edit_callback_media_photo(
     if not callback.message.photo:
         return False
 
-    try:
-        media = InputMediaPhoto(media=photo, caption=caption)
-        await callback.message.edit_media(media=media, reply_markup=reply_markup)
-        return True
-    except TelegramBadRequest as error:
-        if "message is not modified" in error.message.lower():
+    for attempt in range(2):
+        try:
+            media = InputMediaPhoto(media=photo, caption=caption)
+            await callback.message.edit_media(media=media, reply_markup=reply_markup, request_timeout=20)
             return True
-        logger.info(error.message)
-        return False
+        except TelegramBadRequest as error:
+            if "message is not modified" in (error.message or "").lower():
+                return True
+            logger.info(error.message)
+            return False
+        except TelegramNetworkError as error:
+            if attempt == 0:
+                await asyncio.sleep(0.6)
+                continue
+            logger.warning("Telegram timeout while editing media: %s", error)
+            return False
+    return False
 
 
 # ----------------------------
