@@ -1,7 +1,0 @@
-services:
-  homework_bot:
-    container_name: homework_bot
-    build: .
-    env_file:
-      - telegram_bot/.env
-    restart: unless-stopped
